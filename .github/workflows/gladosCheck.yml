@@ -49,6 +49,9 @@ jobs:
       run: |
         python checkin.py
       env:
+        PUSHME_HOST: ${{ secrets.PUSHME_HOST }}
+        PUSHME_KEY: ${{ secrets.PUSHME_KEY }}
+        PUSHME_TYPE: ${{ secrets.PUSHME_TYPE }}
         PUSHDEER_SENDKEY: ${{ secrets.PUSHDEER_SENDKEY }}
         GLADOS_COOKIES: ${{ secrets.GLADOS_COOKIES }}
         GLADOS_EXCHANGE_PLAN: ${{ secrets.GLADOS_EXCHANGE_PLAN }}

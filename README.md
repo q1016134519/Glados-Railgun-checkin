@@ -44,7 +44,19 @@
 
 > 不配置时默认不进行自动兑换；如需兑换，设置 `GLADOS_EXCHANGE_PLAN` 为 `plan100` / `plan200` / `plan500`。
 
-4. 手机推送（非必须）
+4. 手机推送（非必须，两种渠道可任选其一，也可同时开启）
+
+**方式一：PushMe（推荐，支持自建服务）**
+
+[PushMe](https://github.com/yafoo/pushme) 是轻量安卓消息客户端，可自建服务端（[pushme-server](https://github.com/yafoo/pushme-server)）。签到结果会带主题色推送到手机：全成功绿色、部分失败橙色、全失败红色。
+
+- 添加 `repository secret`，命名为 `PUSHME_HOST`，值为你的服务地址（**必须带协议，不带结尾斜杠**），例如 `https://push.i-i.me` 或 `https://push.example.com`
+- 添加 `repository secret`，命名为 `PUSHME_KEY`，值为 APP 内显示的 `push_key`
+- （可选）添加 `PUSHME_TYPE` 指定消息类型，支持 `text` / `markdown` / `html` / `url`，默认 `markdown`
+
+> 自建服务需对外开放 HTTP 接口（默认 3010 端口）并做好鉴权；`PUSHME_HOST` 与 `PUSHME_KEY` 同时配置才会启用，只配一个会在日志中提示并跳过。
+
+**方式二：PushDeer**
 
 - 添加1个`repository secret`，命名为`PUSHDEER_SENDKEY`，其值对应 PushDeer key: ([获取地址](https://www.pushdeer.com/product.html))。
 
@@ -68,6 +80,7 @@
 - **2026-04**: 优化代码逻辑，优化日志输出，支持[新版域名](https://railgun.info) ，在 GLADOS_COOKIES 中添加新版域名下的 cookies 即可使用。
 - **2026-09**: 新增设备平台自适应重试（code 4 无需手动配置 UA 即可自动恢复）；默认关闭自动兑换，需显式配置 `GLADOS_EXCHANGE_PLAN` 才启用。
 - **2026-09**: 新增网络层重试/退避：`requests.Session` 挂载 `HTTPAdapter` + `urllib3.Retry`（total=3、指数退避 1/2/4s、对 429/5xx 自动重试），降低 CI 网络抖动导致的误报失败；业务 200 响应不受影响。
+- **2026-10**: 新增 PushMe 推送渠道（支持**自建服务端**，配置 `PUSHME_HOST` + `PUSHME_KEY`），标题自动带主题标记（成功/警告/失败），推送内容按 markdown 渲染换行；PushDeer 保留为可选渠道，两者可同时启用。
 
 
 ## 问题排查与定位

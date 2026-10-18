@@ -5,7 +5,10 @@ import logging
 from enum import Enum
 from typing import Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass, asdict
-from pypushdeer import PushDeer
+try:
+    from pypushdeer import PushDeer
+except ImportError:  # 未安装 pypushdeer 时仍可使用 PushMe
+    PushDeer = None
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from logging_config import init_logger
@@ -97,9 +100,22 @@ class Config:
     """应用配置"""
 
     ENV_PUSH_KEY = "PUSHDEER_SENDKEY"
+    ENV_PUSHME_HOST = "PUSHME_HOST"
+    ENV_PUSHME_KEY = "PUSHME_KEY"
+    ENV_PUSHME_TYPE = "PUSHME_TYPE"
     ENV_COOKIES = "GLADOS_COOKIES"
     ENV_EXCHANGE_PLAN = "GLADOS_EXCHANGE_PLAN"
     ENV_VERBOSE = "GLADOS_VERBOSE"
+
+    """PushMe 兼容别名（与 APP 设置里 self_api / self_key 命名一致）"""
+    PUSHME_HOST_ALIASES = ("PUSHME_SELF_API", "PUSHME_SELF_HOST")
+    PUSHME_KEY_ALIASES = ("PUSHME_SELF_KEY",)
+
+    """PushMe 默认消息类型"""
+    DEFAULT_PUSHME_TYPE = "markdown"
+
+    """PushMe 支持的消息类型"""
+    PUSHME_TYPES = {"text", "markdown", "html", "url", "data", "markdata", "chart", "echarts", "svg"}
 
     """默认兑换计划（none 表示不自动兑换）"""
     DEFAULT_EXCHANGE_PLAN = "none"
@@ -119,14 +135,32 @@ class Config:
 
     def __init__(self):
         self.push_key: str = ""
+        self.pushme_host: str = ""
+        self.pushme_key: str = ""
+        self.pushme_type: str = self.DEFAULT_PUSHME_TYPE
         self.cookies_list: List[str] = []
         self.exchange_plan: str = self.DEFAULT_EXCHANGE_PLAN
         self.verbose: bool = self.DEFAULT_VERBOSE
         self._load_config()
 
+    @staticmethod
+    def _first_env(primary: str, aliases: Tuple[str, ...] = ()) -> Optional[str]:
+        """取第一个非空环境变量"""
+        value = os.environ.get(primary)
+        if value:
+            return value
+        for alias in aliases:
+            value = os.environ.get(alias)
+            if value:
+                return value
+        return None
+
     def _load_config(self) -> None:
         """加载配置"""
         push_key_env: Optional[str] = os.environ.get(self.ENV_PUSH_KEY)
+        pushme_host_env: Optional[str] = self._first_env(self.ENV_PUSHME_HOST, self.PUSHME_HOST_ALIASES)
+        pushme_key_env: Optional[str] = self._first_env(self.ENV_PUSHME_KEY, self.PUSHME_KEY_ALIASES)
+        pushme_type_env: Optional[str] = os.environ.get(self.ENV_PUSHME_TYPE)
         raw_cookies_env: Optional[str] = os.environ.get(self.ENV_COOKIES)
         exchange_plan_env: Optional[str] = os.environ.get(self.ENV_EXCHANGE_PLAN)
         verbose_env: Optional[str] = os.environ.get(self.ENV_VERBOSE)
@@ -136,6 +170,22 @@ class Config:
             self.push_key = ""
         else:
             self.push_key = push_key_env
+
+        # PushMe（自建服务）：host 与 key 都配置才启用
+        self.pushme_host = (pushme_host_env or "").strip().rstrip("/")
+        self.pushme_key = (pushme_key_env or "").strip()
+
+        if pushme_type_env:
+            if pushme_type_env.lower() in self.PUSHME_TYPES:
+                self.pushme_type = pushme_type_env.lower()
+            else:
+                logger.warning(f"{LogEmoji.WARNING} 环境变量 '{self.ENV_PUSHME_TYPE}' 的值 '{pushme_type_env}' 无效，将使用默认值 {self.DEFAULT_PUSHME_TYPE}。")
+                self.pushme_type = self.DEFAULT_PUSHME_TYPE
+
+        if self.pushme_key and not self.pushme_host:
+            logger.warning(f"{LogEmoji.WARNING} 已设置 '{self.ENV_PUSHME_KEY}' 但缺少 '{self.ENV_PUSHME_HOST}'，PushMe 推送将被跳过。")
+        if self.pushme_host and not self.pushme_key:
+            logger.warning(f"{LogEmoji.WARNING} 已设置 '{self.ENV_PUSHME_HOST}' 但缺少 '{self.ENV_PUSHME_KEY}'，PushMe 推送将被跳过。")
 
         if not raw_cookies_env:
             logger.warning(f"{LogEmoji.WARNING} 环境变量 '{self.ENV_COOKIES}' 未设置。")
@@ -158,6 +208,7 @@ class Config:
 
         logger.info(f"{LogEmoji.INFO} 共加载了 {len(self.cookies_list)} 个 Cookie 用于签到。")
         logger.info(f"{LogEmoji.INFO} 当前 {self.ENV_PUSH_KEY} {'已设置' if push_key_env else '未设置'}。")
+        logger.info(f"{LogEmoji.INFO} 当前 {self.ENV_PUSHME_HOST}: {self.pushme_host or '未设置'}，{'已配置' if self.pushme_ready else '未配置'} PushMe 推送。")
         logger.info(f"{LogEmoji.INFO} 当前 {self.ENV_EXCHANGE_PLAN}: {self.exchange_plan}。")
 
         if verbose_env is not None:
@@ -170,6 +221,11 @@ class Config:
                 logger.warning(f"{LogEmoji.WARNING} 环境变量 '{self.ENV_VERBOSE}' 的值 '{verbose_env}' 无效，将使用默认值 {self.DEFAULT_VERBOSE}。")
 
         logger.info(f"{LogEmoji.INFO} 当前 {self.ENV_VERBOSE}: {self.verbose}。")
+
+    @property
+    def pushme_ready(self) -> bool:
+        """PushMe 是否已完整配置"""
+        return bool(self.pushme_host and self.pushme_key)
 
 
 # 各平台合法 User-Agent（版本号无关，仅平台 token 关键）
@@ -451,25 +507,91 @@ class CheckinResult:
 
 
 class PushService:
-    """推送服务"""
+    """推送服务（支持自建 PushMe 与 PushDeer，可同时启用）"""
 
-    def __init__(self, config: Config):
+    PUSHME_TIMEOUT = 20
+    PUSHME_SUCCESS = "success"
+    TITLE_THEMES = ("i", "s", "w", "f")
+
+    def __init__(self, config: Optional[Config]):
         self.config = config
 
-    def send(self, title: str, content: str) -> bool:
-        """发送推送"""
-        if not self.config.push_key:
-            logger.info(f"{LogEmoji.WARNING} 未设置推送密钥，跳过推送通知。")
+    def send(self, title: str, content: str, theme: Optional[str] = None) -> bool:
+        """发送推送；theme 为主题标记 i/s/w/f（仅 PushMe 生效）"""
+        if not self.config:
+            logger.warning(f"{LogEmoji.WARNING} 配置未加载，跳过推送通知。")
             return False
 
+        enabled = []
+        if self.config.pushme_ready:
+            enabled.append("PushMe")
+        if self.config.push_key:
+            enabled.append("PushDeer")
+
+        if not enabled:
+            logger.info(f"{LogEmoji.WARNING} 未设置任何推送密钥，跳过推送通知。")
+            return False
+
+        logger.info(f"{LogEmoji.INFO} 推送渠道: {', '.join(enabled)}")
+
+        sent = False
+        if self.config.pushme_ready:
+            sent = self._send_pushme(title, content, theme) or sent
+        if self.config.push_key:
+            sent = self._send_pushdeer(title, content) or sent
+        return sent
+
+    def _send_pushme(self, title: str, content: str, theme: Optional[str] = None) -> bool:
+        """通过自建 PushMe Server 的 HTTP 接口推送"""
+        url = f"{self.config.pushme_host}/"
+        message_type = self.config.pushme_type
+        payload = {
+            "push_key": self.config.pushme_key,
+            "title": self._decorate_title(title, theme),
+            "content": self._to_markdown(content) if message_type == "markdown" else content,
+            "type": message_type,
+        }
+
+        try:
+            response = requests.post(url, data=payload, timeout=self.PUSHME_TIMEOUT)
+            body = (response.text or "").strip()
+            if response.ok and body[: len(self.PUSHME_SUCCESS)].lower() == self.PUSHME_SUCCESS:
+                logger.info(f"{LogEmoji.SUCCESS} PushMe 推送成功。")
+                return True
+            logger.error(f"{LogEmoji.ERROR} PushMe 推送失败: HTTP {response.status_code}, 返回: {body[:200]}")
+            return False
+        except requests.exceptions.RequestException as e:
+            logger.error(f"{LogEmoji.ERROR} PushMe 推送请求异常: {e}")
+            return False
+
+    def _send_pushdeer(self, title: str, content: str) -> bool:
+        """通过 PushDeer 推送（保留原有行为）"""
+        if PushDeer is None:
+            logger.error(f"{LogEmoji.ERROR} 未安装 pypushdeer，跳过 PushDeer 推送。")
+            return False
         try:
             pushdeer = PushDeer(pushkey=self.config.push_key)
             pushdeer.send_text(title, desp=content)
-            logger.info(f"{LogEmoji.SUCCESS} 推送通知发送成功。")
+            logger.info(f"{LogEmoji.SUCCESS} PushDeer 推送通知发送成功。")
             return True
         except Exception as e:
-            logger.error(f"{LogEmoji.ERROR} 发送推送通知失败: {e}")
+            logger.error(f"{LogEmoji.ERROR} PushDeer 推送失败: {e}")
             return False
+
+    @classmethod
+    def _decorate_title(cls, title: str, theme: Optional[str]) -> str:
+        """在标题前加主题标记：[i]信息 [s]成功 [w]警告 [f]失败"""
+        if not theme or theme not in cls.TITLE_THEMES:
+            return title
+        prefix = f"[{theme}]"
+        return title if title.startswith(prefix) else f"{prefix}{title}"
+
+    @staticmethod
+    def _to_markdown(content: str) -> str:
+        """把逐行结果转成 markdown 列表，保证 App 内换行正常渲染"""
+        if not content.strip():
+            return content
+        return "\n".join(f"- {line}" if line.strip() else "" for line in content.splitlines())
 
 
 class Checker:
@@ -552,8 +674,8 @@ class Checker:
         """获取所有结果"""
         return [result.to_dict() for result in self.results]
 
-    def format_results(self) -> Tuple[str, str, str]:
-        """格式化结果"""
+    def format_results(self) -> Tuple[str, str, str, str]:
+        """格式化结果，返回 (标题, 推送内容, 日志内容, 主题标记)"""
         results = self.get_results()
 
         success_count = sum(1 for r in results if r["code"] == CheckinStatus.SUCCESS)
@@ -561,6 +683,16 @@ class Checker:
         fail_count = sum(1 for r in results if r["code"] == CheckinStatus.FAILURE)
 
         title = f"GLaDOS 签到, 成功{success_count}, 失败{fail_count}, 重复{repeat_count}"
+
+        # 主题标记：全失败红、有失败橙、全成功绿
+        if fail_count and fail_count == len(results):
+            theme = "f"
+        elif fail_count:
+            theme = "w"
+        elif success_count:
+            theme = "s"
+        else:
+            theme = "i"
 
         send_content_lines = []
         log_content_lines = []
@@ -576,7 +708,7 @@ class Checker:
 
         content = "\n".join(send_content_lines)
         log_content = "\n".join(log_content_lines)
-        return title, content, log_content
+        return title, content, log_content, theme
 
 
 # 初始化日志
@@ -585,6 +717,9 @@ logger = init_logger()
 
 def main():
     """主函数"""
+    config: Optional[Config] = None
+    title, content, theme = "GLaDOS 签到", "", "i"
+
     try:
         # 1. 加载配置
         logger.info(f"{LogEmoji.START} 步骤 1: 加载配置")
@@ -592,7 +727,7 @@ def main():
 
         if not config.cookies_list:
             logger.error(f"{LogEmoji.ERROR} 未找到有效的 Cookie, 退出程序。")
-            title, content = "# 未找到 cookies!", ""
+            title, content, theme = "未找到 cookies!", "", "f"
         else:
             # 2. 执行签到
             logger.info(f"{LogEmoji.START} 步骤 2: 执行签到")
@@ -601,17 +736,17 @@ def main():
 
             # 3. 格式化结果
             logger.info(f"{LogEmoji.START} 步骤 3: 格式化结果")
-            title, content, log_content = checker.format_results()
+            title, content, log_content, theme = checker.format_results()
             logger.info(f"\n{LogEmoji.END}========== 签到总结 ==========\n{title}\n{log_content}")
 
     except Exception as e:
         logger.error(f"{LogEmoji.ERROR} 主程序执行过程中发生未预期的错误: {e}")
-        title, content, log_content = "# 脚本执行出错", str(e), str(e)
+        title, content, theme = "脚本执行出错", str(e), "f"
 
     # 4. 发送推送
     logger.info(f"{LogEmoji.START} 步骤 4: 发送推送")
-    push_service = PushService(config if "config" in locals() else "")
-    push_service.send(title, content)
+    push_service = PushService(config)
+    push_service.send(title, content, theme)
     logger.info(f"{LogEmoji.END} 签到完成")
 
 
